@@ -84,6 +84,9 @@ serial_test = "3.0.0"
 temp-env = "0.3.6"
 tokio = { version = "1.44", features = ["full"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "stdio", "termios", "pty"] }
+
 # Examples
 [[example]]
 name = "event-read"

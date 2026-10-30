@@ -21,6 +21,36 @@ const WAKE_TOKEN: Token = Token(2);
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
 
+/// Why the terminal input can not deliver events anymore.
+#[derive(Clone, Copy, Debug)]
+enum InputClosed {
+    /// `read` returned 0: the other end of the terminal is gone.
+    Eof,
+    /// `read` failed with this OS error (`EIO` for a pty whose master side is gone).
+    Os(i32),
+    /// `read` failed with an error that carries no OS error code.
+    Other(io::ErrorKind),
+}
+
+impl InputClosed {
+    fn from_read_error(error: &io::Error) -> Self {
+        match error.raw_os_error() {
+            Some(code) => InputClosed::Os(code),
+            None => InputClosed::Other(error.kind()),
+        }
+    }
+
+    fn to_error(self) -> io::Error {
+        match self {
+            InputClosed::Eof => {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "terminal input closed")
+            }
+            InputClosed::Os(code) => io::Error::from_raw_os_error(code),
+            InputClosed::Other(kind) => io::Error::new(kind, "terminal input failed"),
+        }
+    }
+}
+
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
     events: Events,
@@ -28,6 +58,10 @@ pub(crate) struct UnixInternalEventSource {
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
     signals: Signals,
+    /// Set once the terminal input is found closed or broken. `mio` reports readiness only on a
+    /// change, so there will be no second wake-up for the same condition: report the stored error
+    /// on every later `try_read` instead of waiting for input that can not arrive.
+    closed: Option<InputClosed>,
     #[cfg(feature = "event-stream")]
     waker: Waker,
 }
@@ -58,9 +92,22 @@ impl UnixInternalEventSource {
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
             signals,
+            closed: None,
             #[cfg(feature = "event-stream")]
             waker,
         })
+    }
+}
+
+impl UnixInternalEventSource {
+    /// Remembers that the input is closed. Events that were already parsed are delivered first;
+    /// the error follows once they are consumed.
+    fn report_closed(&mut self, closed: InputClosed) -> io::Result<Option<InternalEvent>> {
+        self.closed = Some(closed);
+        match self.parser.next() {
+            Some(event) => Ok(Some(event)),
+            None => Err(closed.to_error()),
+        }
     }
 }
 
@@ -68,6 +115,10 @@ impl EventSource for UnixInternalEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
         if let Some(event) = self.parser.next() {
             return Ok(Some(event));
+        }
+
+        if let Some(closed) = self.closed {
+            return Err(closed.to_error());
         }
 
         let timeout = PollTimeout::new(timeout);
@@ -94,24 +145,27 @@ impl EventSource for UnixInternalEventSource {
                     TTY_TOKEN => {
                         loop {
                             match self.tty_fd.read(&mut self.tty_buffer) {
+                                // End of input: the terminal went away. Spinning on it would never
+                                // return control to the caller.
+                                Ok(0) => return self.report_closed(InputClosed::Eof),
                                 Ok(read_count) => {
-                                    if read_count > 0 {
-                                        self.parser.advance(
-                                            &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
-                                        );
-                                    }
+                                    self.parser.advance(
+                                        &self.tty_buffer[..read_count],
+                                        read_count == TTY_BUFFER_SIZE,
+                                    );
                                 }
-                                Err(e) => {
-                                    // No more data to read at the moment. We will receive another event
-                                    if e.kind() == io::ErrorKind::WouldBlock {
-                                        break;
+                                Err(e) => match e.kind() {
+                                    // No more data to read at the moment. We will receive another
+                                    // event once more data is available to read.
+                                    io::ErrorKind::WouldBlock => break,
+                                    io::ErrorKind::Interrupted => continue,
+                                    // Anything else (e.g. `EIO` after the pty master was closed) is
+                                    // not recoverable: hand it to the caller.
+                                    _ => {
+                                        return self
+                                            .report_closed(InputClosed::from_read_error(&e));
                                     }
-                                    // once more data is available to read.
-                                    else if e.kind() == io::ErrorKind::Interrupted {
-                                        continue;
-                                    }
-                                }
+                                },
                             };
 
                             if let Some(event) = self.parser.next() {
@@ -225,5 +279,123 @@ impl Iterator for Parser {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.internal_events.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsStr,
+        io::{self, Write},
+        os::unix::{ffi::OsStrExt, net::UnixStream},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use super::UnixInternalEventSource;
+    use crate::event::source::EventSource;
+    use crate::event::{Event, InternalEvent, KeyCode};
+    use crate::terminal::sys::file_descriptor::FileDesc;
+
+    /// How long a test waits for `try_read` before it decides the read loop never returns.
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    #[cfg(not(feature = "libc"))]
+    fn file_desc(fd: impl Into<rustix::fd::OwnedFd>) -> FileDesc<'static> {
+        FileDesc::Owned(fd.into())
+    }
+
+    #[cfg(feature = "libc")]
+    fn file_desc(fd: impl std::os::unix::io::IntoRawFd) -> FileDesc<'static> {
+        FileDesc::new(fd.into_raw_fd(), true)
+    }
+
+    /// Runs `f` on a helper thread. A reader that never returns (the bug these tests guard
+    /// against) then fails the test instead of hanging the whole test run.
+    fn run_with_deadline<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(DEADLINE)
+            .expect("`try_read` did not return: the read loop spins on a closed terminal")
+    }
+
+    #[test]
+    fn eof_on_input_is_reported_as_an_error() {
+        let (input, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+
+        let (first, second) = run_with_deadline(move || {
+            let mut source =
+                UnixInternalEventSource::from_file_descriptor(file_desc(input)).unwrap();
+            let first = source.try_read(Some(Duration::from_secs(1)));
+            let second = source.try_read(Some(Duration::from_secs(1)));
+            (first, second)
+        });
+
+        // EOF is sticky: every later read reports it again instead of waiting forever.
+        for result in [first, second] {
+            let error = result.expect_err("EOF must be reported, not swallowed");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn input_is_delivered_before_the_closure_is_reported() {
+        let (input, mut peer) = UnixStream::pair().unwrap();
+
+        let (first, second) = run_with_deadline(move || {
+            let mut source =
+                UnixInternalEventSource::from_file_descriptor(file_desc(input)).unwrap();
+            peer.write_all(b"a").unwrap();
+            let first = source.try_read(Some(Duration::from_secs(1)));
+            drop(peer);
+            let second = source.try_read(Some(Duration::from_secs(1)));
+            (first, second)
+        });
+
+        assert_eq!(
+            first.unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('a').into())))
+        );
+        let error = second.expect_err("EOF must follow the delivered input");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn closing_the_pty_master_is_reported_as_an_error() {
+        use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
+
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        grantpt(&master).unwrap();
+        unlockpt(&master).unwrap();
+        let slave_name = ptsname(&master, Vec::new()).unwrap();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(OsStr::from_bytes(slave_name.to_bytes()))
+            .unwrap();
+        // This is what closing the terminal window does to the process reading the slave side.
+        drop(master);
+
+        let (first, second) = run_with_deadline(move || {
+            let mut source =
+                UnixInternalEventSource::from_file_descriptor(file_desc(slave)).unwrap();
+            let first = source.try_read(Some(Duration::from_secs(1)));
+            let second = source.try_read(Some(Duration::from_secs(1)));
+            (first, second)
+        });
+
+        // Linux reports EIO for a pty slave whose master is gone; macOS reports plain EOF.
+        for result in [first, second] {
+            let error = result.expect_err("a closed terminal must be reported, not swallowed");
+            assert!(
+                error.kind() == io::ErrorKind::UnexpectedEof
+                    || error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()),
+                "unexpected error for a closed pty: {error:?}"
+            );
+        }
     }
 }
